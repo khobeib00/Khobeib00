@@ -1,0 +1,259 @@
+import os
+import sqlite3
+import chess
+from telebot import TeleBot, types
+
+# ==========================================
+# 1. الإعدادات العامة والتوكين
+# ==========================================
+TOKEN = os.getenv("BOT_TOKEN", "8884224118:AAGfcnzmOJrYjElWslvhO5rAmJAd42zedkk")
+bot = TeleBot(TOKEN)
+DB_NAME = "chess_bot.db"
+
+# ==========================================
+# 2. إدارة قاعدة البيانات (SQLite)
+# ==========================================
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                elo INTEGER DEFAULT 1200,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                draws INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS games (
+                chat_id INTEGER PRIMARY KEY,
+                fen TEXT NOT NULL,
+                white_id INTEGER NOT NULL,
+                black_id INTEGER NOT NULL,
+                selected_sq INTEGER DEFAULT NULL
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+def get_or_create_user(user_id, username):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO users (user_id, username) VALUES (?, ?)", 
+                (user_id, username or f"Player_{user_id}")
+            )
+            conn.commit()
+
+def save_game(chat_id, board, white_id, black_id, selected_sq=None):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO games (chat_id, fen, white_id, black_id, selected_sq)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                fen = excluded.fen,
+                selected_sq = excluded.selected_sq
+        ''', (chat_id, board.fen(), white_id, black_id, selected_sq))
+        conn.commit()
+
+def load_game(chat_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT fen, white_id, black_id, selected_sq FROM games WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'board': chess.Board(row[0]),
+                'white': row[1],
+                'black': row[2],
+                'selected': row[3]
+            }
+    return None
+
+def delete_game(chat_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM games WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+
+# ==========================================
+# 3. الأزرار والواجهة التفاعلية
+# ==========================================
+UNICODE_PIECES = {
+    'r': '♜', 'n': '♞', 'b': '♝', 'q': '♛', 'k': '♚', 'p': '♟',
+    'R': '♖', 'N': '♘', 'B': '♗', 'Q': '♕', 'K': '♔', 'P': '♙',
+    '.': ' '
+}
+
+def get_board_keyboard(board: chess.Board, selected_sq=None, legal_moves=None):
+    if legal_moves is None:
+        legal_moves = []
+        
+    markup = types.InlineKeyboardMarkup(row_width=8)
+    buttons = []
+    
+    for rank in range(7, -1, -1):
+        for file in range(8):
+            sq = chess.square(file, rank)
+            piece = board.piece_at(sq)
+            symbol = UNICODE_PIECES[piece.symbol()] if piece else ' '
+            
+            if selected_sq == sq:
+                display = f"[{symbol if symbol != ' ' else '🔹'}]"
+            elif sq in legal_moves:
+                display = "🟢" if symbol == ' ' else "🎯"
+            else:
+                display = symbol if symbol != ' ' else '·'
+                
+            buttons.append(types.InlineKeyboardButton(text=display, callback_data=f"sq_{sq}"))
+            
+    markup.add(*buttons)
+    markup.row(
+        types.InlineKeyboardButton("❌ إلغاء التحديد", callback_data="action_cancel"),
+        types.InlineKeyboardButton("🏳️ استسلام", callback_data="action_resign")
+    )
+    return markup
+
+def get_promotion_keyboard(from_sq, to_sq):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("♛ وزير", callback_data=f"prom_{from_sq}_{to_sq}_q"),
+        types.InlineKeyboardButton("♜ قلعة", callback_data=f"prom_{from_sq}_{to_sq}_r"),
+        types.InlineKeyboardButton("♝ فيل", callback_data=f"prom_{from_sq}_{to_sq}_b"),
+        types.InlineKeyboardButton("♞ حصان", callback_data=f"prom_{from_sq}_{to_sq}_n")
+    )
+    return markup
+
+# ==========================================
+# 4. معالجة الأوامر واللعب
+# ==========================================
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    get_or_create_user(message.from_user.id, message.from_user.username)
+    text = (
+        "مرحباً بك في بوت الشطرنج! ♟️\n\n"
+        "• /botgame - بدء مباراة جديدة ضد البوت\n"
+        "• /stats - عرض إحصائياتك"
+    )
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=['botgame'])
+def start_bot_game(message):
+    chat_id = message.chat.id
+    get_or_create_user(message.from_user.id, message.from_user.username)
+    board = chess.Board()
+    save_game(chat_id, board, white_id=message.from_user.id, black_id=-1)
+    
+    bot.send_message(
+        chat_id, 
+        "بدأت المباراة! دورك الآن (الأبيض):", 
+        reply_markup=get_board_keyboard(board)
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('sq_'))
+def handle_square_click(call):
+    chat_id = call.message.chat.id
+    game = load_game(chat_id)
+    
+    if not game:
+        bot.answer_callback_query(call.id, "لا توجد لعبة قائمة. أرسل /botgame")
+        return
+
+    board = game['board']
+    sq = int(call.data.split('_')[1])
+    
+    # 1. تحديد القطعة
+    if game['selected'] is None:
+        piece = board.piece_at(sq)
+        if piece and piece.color == chess.WHITE:
+            save_game(chat_id, board, game['white'], game['black'], selected_sq=sq)
+            legal_destinations = [m.to_square for m in board.legal_moves if m.from_square == sq]
+            bot.edit_message_reply_markup(
+                chat_id, call.message.message_id, 
+                reply_markup=get_board_keyboard(board, selected_sq=sq, legal_moves=legal_destinations)
+            )
+            
+    # 2. تحريك القطعة
+    else:
+        from_sq = game['selected']
+        
+        # ترقية البيذق
+        is_pawn = board.piece_at(from_sq) and board.piece_at(from_sq).piece_type == chess.PAWN
+        if is_pawn and chess.square_rank(sq) == 7 and chess.Move(from_sq, sq, promotion=chess.QUEEN) in board.legal_moves:
+            bot.edit_message_text(
+                "اختر القطعة للترقية:", chat_id, call.message.message_id, 
+                reply_markup=get_promotion_keyboard(from_sq, sq)
+            )
+            return
+
+        move = chess.Move(from_sq, sq)
+        if move in board.legal_moves:
+            execute_move(chat_id, call.message.message_id, move)
+        else:
+            save_game(chat_id, board, game['white'], game['black'], selected_sq=None)
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_board_keyboard(board))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('prom_'))
+def handle_promotion(call):
+    chat_id = call.message.chat.id
+    _, from_sq, to_sq, piece_code = call.data.split('_')
+    piece_map = {'q': chess.QUEEN, 'r': chess.ROOK, 'b': chess.BISHOP, 'n': chess.KNIGHT}
+    move = chess.Move(int(from_sq), int(to_sq), promotion=piece_map[piece_code])
+    execute_move(chat_id, call.message.message_id, move)
+
+def execute_move(chat_id, message_id, move):
+    game = load_game(chat_id)
+    board = game['board']
+    board.push(move)
+    save_game(chat_id, board, game['white'], game['black'], selected_sq=None)
+    
+    if board.is_checkmate():
+        bot.edit_message_text("👑 كش مات! فزت باللعبة 🎉", chat_id, message_id, reply_markup=get_board_keyboard(board))
+        delete_game(chat_id)
+        return
+
+    # حركة الذكاء الاصطناعي
+    make_ai_move(chat_id, message_id)
+
+def make_ai_move(chat_id, message_id):
+    game = load_game(chat_id)
+    board = game['board']
+    legal_moves = list(board.legal_moves)
+    
+    if legal_moves:
+        ai_move = legal_moves[0]
+        board.push(ai_move)
+        save_game(chat_id, board, game['white'], game['black'], selected_sq=None)
+        
+        if board.is_checkmate():
+            bot.edit_message_text("👑 كش مات! فاز البوت.", chat_id, message_id, reply_markup=get_board_keyboard(board))
+            delete_game(chat_id)
+            return
+            
+        bot.edit_message_text(
+            "تحرك البوت. دورك الآن (الأبيض):", 
+            chat_id, message_id, reply_markup=get_board_keyboard(board)
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data == "action_cancel")
+def cancel_selection(call):
+    chat_id = call.message.chat.id
+    game = load_game(chat_id)
+    if game:
+        save_game(chat_id, game['board'], game['white'], game['black'], selected_sq=None)
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_board_keyboard(game['board']))
+
+@bot.callback_query_handler(func=lambda call: call.data == "action_resign")
+def resign_game(call):
+    chat_id = call.message.chat.id
+    delete_game(chat_id)
+    bot.edit_message_text("🏳️ تم الاستسلام وإنهاء اللعبة.", chat_id, call.message.message_id)
+
+if __name__ == "__main__":
+    bot.infinity_polling()
