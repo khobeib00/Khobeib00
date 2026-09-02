@@ -1,3 +1,5 @@
 pyTelegramBotAPI
 python-chess
+cairosvg
+pillow
 flask
