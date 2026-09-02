@@ -12,7 +12,7 @@ from telebot import types
 # 1. Configuration & Setup
 # ==========================================
 # التوكن الخاص بك مدمج بالكامل هنا
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8884224118:AAGfcnzmOJrYjElWslvhO5rAmJAd42zedkk")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 bot = telebot.TeleBot(BOT_TOKEN)
